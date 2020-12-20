@@ -1,0 +1,209 @@
+---
+title: "Analyse des donées avec Dada2"
+author: Vincent Noah
+date: "19 décembre 2020"
+output:
+  github_document:
+    toc: true
+    toc_depth: 2
+---
+
+
+# Préparation de l'environnement.
+
+On commence par charger le package dada2 pour pouvoir utiliser les fonctions lors de l'analyse.
+
+```{r}
+library(Rcpp)
+library(dada2)
+```
+
+
+Les données contenues dans St_Stratif sont des séquences d'ARN 16s à partir d'échantillons d'eau de mer de la rade de Brest, obtenu par séquençage illumina. St_Stratif contient donc les forwards et les reverses. On va créer un objet path dans lequel on va mettre toutes les données de Miseq_SOP. On vérifie par la suite les fichiers contenus dans path avec la commande list.files
+
+```{r}
+path <- "~/St_Stratif"
+list.files(path)
+```
+
+
+Une fois que l'on a observé et vérifié le contenu des fichiers dans path, on peut trier ces fichiers dans différents objets pour permettre l'analyse. On va donc créer l'objet fnFs qui contiendra tous les forwards, en indiquant à R de mettre tous les fichiers contenant le format _R1.fastq dans fnFs tout en gardant le nom entier des fichiers avec la commande full.name= TRUE.
+On réitère les mêmes opérations pour les Reverses (R2) avec l'objet fnRs. Afin de faciliter l'analyse et pour ne pas avoir des noms trop longs, on va "simplifier" les noms des fichiers fnFs avec la commande sapply en précisant à R que l'on veut enlever toutes les chaines de caractères (strsplit) après le "_R1", puis on va mettre ces noms simplifiés dans un nouvel objet appelé sample.name
+
+```{r}
+fnFs <- sort(list.files(path, pattern="_R1.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_R"), `[`, 1)
+```
+
+
+# Inspecter les profils de qualité des lectures.
+
+Une fois l'environnement préparé, on va maintenant inspecter les scores de qualité des FnFs, en traçant un graphique (plot) comprenant les fichiers fnFs 1 à 4. Ce graphique va nous permettre de visualiser les pertes significatives de qualité, et donc nous permettre de savoir sur quel nucléotide ou va pouvoir "couper" pour obtenir des séquences plus nettes. 
+
+* On observe que les forwards sont plutôt de bonne qualité. C'est pour cela que l'on va décider de ne pas tronquer.
+
+```{r}
+plotQualityProfile(fnFs[1:4])
+```
+
+* Les Reverse reads possède un score de qualité nettement inférieur par rapport au forward reads. C'est un phénomène courant lors du séquençage illumina. En effet, on observe une chute de la qualité à partir du nucléotide 150. Cependant on ne peut pas tout tronquer (il faut penser à l'alignement). C'est pour cela que l'on a décidé de tronquer à partir de nucléotide 200.
+
+```{r}
+plotQualityProfile(fnRs[1:4])
+```
+
+
+# Filtration et tronquage.
+
+
+On commence par créer deux fichiers (filtFs et filrRs) où on va regrouper les fichiers fasq, une fois qu'ils seront filtrés, en utilisant les noms simplifiés. 
+
+```{r}
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+
+Tout d'abord, avec la fonction TimLeft=21, on indique a R de tronquer les amorces. Ensuite, on indique à R que l'on veut tronquer les forwards à partir du nucléotide 250 ce qui correspond à aucun tronquage. Pour les reverses on indique à R de couper à partir du nucléotide 200.
+
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(250,200),trimLeft = (21),
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+head(out)
+```
+
+# Connaitre le taux d'erreur.
+
+
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE)
+```
+
+```{r}
+
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+
+* La ligne noire montre le taux d'erreurs estimé avec learnErrors.
+
+
+
+* La ligne en rouge montre le taux d'erreur observé.
+
+
+
+* On observe qu'il y a peu de différence.
+
+```{r}
+plotErrors(errF, nominalQ=TRUE)
+```
+
+# Inférence d'échantillon.
+
+Le package Dada2 contient un algorithme d'interférence aux données que nous venons juste de filtrer et de tronquer. Cela nous permet d'enlever les bruits de fond, pour les R1 et les R2.
+
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+```
+ 
+
+
+```{r}
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+```
+
+
+# Alignement des R1 et R2 en contigs.
+
+Grâce à la fonction mergerPair, on va pouvoir maintenant aligner les R1 et R2 pour former des contigs. Dans les arguments de cette fonction on précise que l'on utilise les fichiers filtrés et tronqués. On va stoquer ces données dans un nouvel objet mergers. La sortie, nous montre les séquences qui ont pu être alignées en contigs par rapport à l'ensemble des séquences.
+
+```{r,}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+
+# Construction de la table d'observation.
+
+On va maintenant créer une table de séquences grâce à la fonction "makeSequenceTable" à partir des contigs obtenus et placé dans l'objet mergers.
+
+```{r,}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+
+
+# Détection de chimères.
+
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+```
+
+# Pourcentage de séquences chimérique dans l'ensemble de la table.
+
+On peut déterminer le pourcentage du taux de chimères. On trouve qu'il y a 78 % de séquences chimérique dans notre jeu de donnée.
+
+```{r}
+1-sum(seqtab.nochim)/sum(seqtab)
+```
+
+
+On peut observer toutes les étapes qui ont été réalisées.
+
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+print(track)
+```
+
+
+# Téléchargement des bases de donées et assignation d'un taxonomique.
+
+
+
+```{bash, results="hide"}
+wget https://zenodo.org/record/3986799/files/silva_nr99_v138_train_set.fa.gz
+```
+
+
+```{r, results="hide"}
+taxa <- assignTaxonomy(seqtab.nochim, "~/silva_nr99_v138_train_set.fa.gz", multithread=TRUE)
+```
+
+```{bash, results="hide"}
+wget https://zenodo.org/record/3986799/files/silva_species_assignment_v138.fa.gz
+```
+
+```{r, results="hide"}
+taxa<- addSpecies(taxa, "~/silva_species_assignment_v138.fa.gz")
+```
+
+
+On peut maintenant observer nos résultats.
+
+```{r}
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+
+Afin de pouvoir continuer notre analyse avec phyloseq, On va réaliser une sauvegarde, que l'on pourra charger avant l'analyse de phyloseq afin d'avoir toutes les données.
+
+```{r}
+save.image(file="02_Data-analysis-with-DADA2_FinalEnv")
+```
+
+
+Dada 2 nous a permis de préparer les données afin qu'ils puissent être analysés, le plus précisément avec Phyloseq. 
